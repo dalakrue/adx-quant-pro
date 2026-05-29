@@ -1,7 +1,8 @@
-import streamlit as st
+import time
 import pandas as pd
 import requests
-import time
+import streamlit as st
+
 from core.common import synthetic_ohlc, log_event
 
 
@@ -21,7 +22,11 @@ MT5_TIMEFRAMES = {
 
 TWELVE_INTERVALS = {
     "M1": "1min",
+    "M2": "1min",
+    "M3": "1min",
+    "M4": "1min",
     "M5": "5min",
+    "M10": "5min",
     "M15": "15min",
     "M30": "30min",
     "H1": "1h",
@@ -45,11 +50,79 @@ def _import_mt5():
         return None
 
 
-def resample_ohlc(df, timeframe="M2"):
-    if df is None or len(df) == 0 or "time" not in df.columns:
-        return df
+def _clean_symbol(symbol="XAUUSD"):
+    return str(symbol or "XAUUSD").strip().upper().replace("/", "").replace(" ", "")
 
-    tf = str(timeframe or "M1").upper()
+
+def _twelve_symbol(symbol="XAUUSD"):
+    raw = _clean_symbol(symbol)
+
+    mapping = {
+        "XAUUSD": "XAU/USD",
+        "XAGUSD": "XAG/USD",
+        "EURUSD": "EUR/USD",
+        "GBPUSD": "GBP/USD",
+        "USDJPY": "USD/JPY",
+        "AUDUSD": "AUD/USD",
+        "USDCAD": "USD/CAD",
+        "USDCHF": "USD/CHF",
+        "NZDUSD": "NZD/USD",
+        "BTCUSD": "BTC/USD",
+        "ETHUSD": "ETH/USD",
+    }
+
+    return mapping.get(raw, raw)
+
+
+def _normalize_ohlc(df):
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    df = df.copy()
+
+    rename_map = {
+        "datetime": "time",
+        "date": "time",
+        "timestamp": "time",
+        "tick_volume": "volume",
+        "real_volume": "volume",
+    }
+
+    for old, new in rename_map.items():
+        if old in df.columns and new not in df.columns:
+            df = df.rename(columns={old: new})
+
+    if "time" not in df.columns:
+        return pd.DataFrame()
+
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+
+    for c in ["open", "high", "low", "close"]:
+        if c not in df.columns:
+            return pd.DataFrame()
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if "volume" not in df.columns:
+        df["volume"] = 0
+
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+
+    df = df.dropna(subset=["time", "open", "high", "low", "close"])
+    df = df.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    return df[["time", "open", "high", "low", "close", "volume"]].copy()
+
+
+def resample_ohlc(df, timeframe="M2"):
+    df = _normalize_ohlc(df)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    tf = str(timeframe or "M1").strip().upper()
 
     if tf in ("M1", "1MIN", "1T"):
         return df.copy()
@@ -69,61 +142,23 @@ def resample_ohlc(df, timeframe="M2"):
     if not rule:
         return df.copy()
 
-    work = df.copy()
-    work["time"] = pd.to_datetime(work["time"], errors="coerce")
-    work = work.dropna(subset=["time"]).sort_values("time")
-
-    for c in ["open", "high", "low", "close"]:
-        work[c] = pd.to_numeric(work[c], errors="coerce")
-
-    work = work.dropna(subset=["open", "high", "low", "close"])
-
-    if work.empty:
-        return work
-
-    if "volume" not in work.columns:
-        work["volume"] = 0
-
     out = (
-        work.set_index("time")
+        df.set_index("time")
         .resample(rule, label="right", closed="right")
-        .agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        })
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
         .dropna()
         .reset_index()
     )
 
-    return out[["time", "open", "high", "low", "close"]].copy()
-
-
-def _normalize_ohlc(df):
-    if df is None or len(df) == 0:
-        return pd.DataFrame()
-
-    df = df.copy()
-
-    if "datetime" in df.columns and "time" not in df.columns:
-        df = df.rename(columns={"datetime": "time"})
-
-    if "time" not in df.columns:
-        return pd.DataFrame()
-
-    df["time"] = pd.to_datetime(df["time"], errors="coerce")
-
-    for c in ["open", "high", "low", "close"]:
-        if c not in df.columns:
-            return pd.DataFrame()
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df.dropna(subset=["time", "open", "high", "low", "close"])
-    df = df.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
-
-    return df[["time", "open", "high", "low", "close"]].copy()
+    return out[["time", "open", "high", "low", "close", "volume"]].copy()
 
 
 def fetch_mt5(symbol="XAUUSD", timeframe="M1", bars=500):
@@ -138,7 +173,7 @@ def fetch_mt5(symbol="XAUUSD", timeframe="M1", bars=500):
             if not mt5.initialize():
                 return None, False, "MT5 initialize failed. Open MT5 terminal and login first."
 
-        symbol = str(symbol or "XAUUSD").replace("/", "").upper()
+        symbol = _clean_symbol(symbol)
         timeframe = str(timeframe or "M1").upper()
 
         tf_name = MT5_TIMEFRAMES.get(timeframe, "TIMEFRAME_M1")
@@ -147,18 +182,23 @@ def fetch_mt5(symbol="XAUUSD", timeframe="M1", bars=500):
         mt5.symbol_select(symbol, True)
         rates = mt5.copy_rates_from_pos(symbol, tf, 0, int(bars))
 
-        if (rates is None or len(rates) < 30) and timeframe == "M2":
-            rates = mt5.copy_rates_from_pos(symbol, getattr(mt5, "TIMEFRAME_M1"), 0, int(bars) * 2)
-
-            if rates is None or len(rates) < 30:
-                return None, False, "No MT5 M2/M1 rates returned"
-
-            df = pd.DataFrame(rates)
-            df["time"] = pd.to_datetime(df["time"], unit="s", errors="coerce")
-            df = _normalize_ohlc(df)
-            return resample_ohlc(df, "M2"), True, "MT5 M1 resampled to M2"
-
         if rates is None or len(rates) < 30:
+            if timeframe in ["M2", "M3", "M4", "M10"]:
+                rates = mt5.copy_rates_from_pos(
+                    symbol,
+                    getattr(mt5, "TIMEFRAME_M1"),
+                    0,
+                    int(bars) * 5,
+                )
+
+                if rates is None or len(rates) < 30:
+                    return None, False, f"No MT5 {timeframe}/M1 rates returned"
+
+                df = pd.DataFrame(rates)
+                df["time"] = pd.to_datetime(df["time"], unit="s", errors="coerce")
+                df = _normalize_ohlc(df)
+                return resample_ohlc(df, timeframe), True, f"MT5 M1 resampled to {timeframe}"
+
             return None, False, "No MT5 rates returned"
 
         df = pd.DataFrame(rates)
@@ -176,16 +216,7 @@ def fetch_twelve(symbol="XAUUSD", api_key="", interval="1min", bars=500):
         if not api_key:
             return None, False, "Missing Twelve Data API key"
 
-        sym = (
-            str(symbol or "XAUUSD")
-            .upper()
-            .replace("XAUUSD", "XAU/USD")
-            .replace("EURUSD", "EUR/USD")
-            .replace("GBPUSD", "GBP/USD")
-            .replace("USDJPY", "USD/JPY")
-        )
-
-        url = "https://api.twelvedata.com/time_series"
+        sym = _twelve_symbol(symbol)
 
         params = {
             "symbol": sym,
@@ -195,17 +226,24 @@ def fetch_twelve(symbol="XAUUSD", api_key="", interval="1min", bars=500):
             "format": "JSON",
         }
 
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
+        r = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params=params,
+            timeout=20,
+        )
+
+        try:
+            data = r.json()
+        except Exception:
+            return None, False, f"Twelve Data invalid response: HTTP {r.status_code}"
 
         if "values" not in data:
-            return None, False, str(data)[:220]
+            return None, False, str(data)[:250]
 
         df = pd.DataFrame(data["values"]).iloc[::-1].reset_index(drop=True)
-        df["time"] = pd.to_datetime(df["datetime"], errors="coerce")
 
-        for c in ["open", "high", "low", "close"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+        if "datetime" in df.columns:
+            df["time"] = pd.to_datetime(df["datetime"], errors="coerce")
 
         df = _normalize_ohlc(df)
 
@@ -215,23 +253,13 @@ def fetch_twelve(symbol="XAUUSD", api_key="", interval="1min", bars=500):
         return None, False, f"Twelve error: {e}"
 
 
-def fetch_doo_bridge(symbol="XAUUSD", timeframe="M1", bars=500, bridge_url="", bridge_token=""):
-    """
-    Streamlit Cloud-friendly option.
-
-    MT5 cannot normally run directly inside Streamlit Cloud because it needs a local Windows MT5 terminal.
-    This bridge expects your PC/VPS to run a small API server that sends Doo Prime / MT5 candles to Streamlit Cloud.
-
-    Expected bridge response JSON:
-    {
-      "ok": true,
-      "candles": [
-        {"time":"2026-01-01 12:00:00","open":1,"high":2,"low":0.5,"close":1.5}
-      ],
-      "account": {...},
-      "positions": [...]
-    }
-    """
+def fetch_doo_bridge(
+    symbol="XAUUSD",
+    timeframe="M1",
+    bars=500,
+    bridge_url="",
+    bridge_token="",
+):
     try:
         bridge_url = str(bridge_url or "").strip()
 
@@ -239,20 +267,25 @@ def fetch_doo_bridge(symbol="XAUUSD", timeframe="M1", bars=500, bridge_url="", b
             return None, False, "Missing Doo Bridge URL"
 
         headers = {}
+
         if bridge_token:
             headers["Authorization"] = f"Bearer {bridge_token}"
 
         params = {
-            "symbol": symbol,
-            "timeframe": timeframe,
+            "symbol": _clean_symbol(symbol),
+            "timeframe": str(timeframe or "M1").upper(),
             "bars": int(bars),
         }
 
-        r = requests.get(bridge_url, params=params, headers=headers, timeout=20)
-        data = r.json()
+        r = requests.get(bridge_url, params=params, headers=headers, timeout=25)
+
+        try:
+            data = r.json()
+        except Exception:
+            return None, False, f"Doo Bridge invalid response: HTTP {r.status_code}"
 
         if not data.get("ok", False):
-            return None, False, str(data.get("message", data))[:220]
+            return None, False, str(data.get("message", data))[:250]
 
         candles = data.get("candles", [])
 
@@ -306,17 +339,20 @@ def manual_connect(
         source = "DOO_BRIDGE" if ok else "DOO_BRIDGE_FAILED"
 
     elif mode == "twelve":
-        if timeframe == "M2":
-            raw, ok, msg = fetch_twelve(symbol, api_key, interval="1min", bars=int(bars) * 2)
-            df = resample_ohlc(raw, "M2") if ok else raw
-            msg = (msg + " → resampled to M2") if ok else msg
-        else:
-            df, ok, msg = fetch_twelve(
-                symbol,
-                api_key,
-                interval=TWELVE_INTERVALS.get(timeframe, "1min"),
-                bars=bars,
-            )
+        raw_tf = TWELVE_INTERVALS.get(timeframe, "1min")
+
+        raw_bars = int(bars)
+
+        if timeframe in ["M2", "M3", "M4", "M10"]:
+            raw_tf = "1min"
+            raw_bars = int(bars) * 5
+
+        df, ok, msg = fetch_twelve(symbol, api_key, interval=raw_tf, bars=raw_bars)
+
+        if ok and timeframe in ["M2", "M3", "M4", "M10"]:
+            df = resample_ohlc(df, timeframe)
+            msg = f"{msg} → resampled to {timeframe}"
+
         source = "TWELVE" if ok else "TWELVE_FAILED"
 
     else:
@@ -334,54 +370,81 @@ def manual_connect(
             source = "DOO_BRIDGE" if ok else "DOO_BRIDGE_FAILED"
 
         if not ok:
-            if timeframe == "M2":
-                raw, ok, msg = fetch_twelve(symbol, api_key, interval="1min", bars=int(bars) * 2)
-                df = resample_ohlc(raw, "M2") if ok else raw
-                msg = (msg + " → resampled to M2") if ok else msg
-            else:
-                df, ok, msg = fetch_twelve(
-                    symbol,
-                    api_key,
-                    interval=TWELVE_INTERVALS.get(timeframe, "1min"),
-                    bars=bars,
-                )
+            raw_tf = TWELVE_INTERVALS.get(timeframe, "1min")
+            raw_bars = int(bars)
+
+            if timeframe in ["M2", "M3", "M4", "M10"]:
+                raw_tf = "1min"
+                raw_bars = int(bars) * 5
+
+            df, ok, msg = fetch_twelve(symbol, api_key, interval=raw_tf, bars=raw_bars)
+
+            if ok and timeframe in ["M2", "M3", "M4", "M10"]:
+                df = resample_ohlc(df, timeframe)
+                msg = f"{msg} → resampled to {timeframe}"
+
             source = "TWELVE" if ok else "FALLBACK_FAILED"
 
     if not ok and st.session_state.get("last_df") is not None:
-        return st.session_state.last_df, True, "CACHE", msg
+        cached = _normalize_ohlc(st.session_state.last_df)
+        if not cached.empty:
+            return cached, True, "CACHE", msg
 
     if not ok:
-        base_bars = int(bars or 1500) * (2 if timeframe == "M2" else 1)
+        base_bars = int(bars or 1500)
+
+        if timeframe in ["M2", "M3", "M4", "M10"]:
+            base_bars *= 5
+
         df = synthetic_ohlc(symbol, max(base_bars, 1500))
 
-        if timeframe == "M2":
-            df = resample_ohlc(df, "M2")
+        if timeframe in ["M2", "M3", "M4", "M10"]:
+            df = resample_ohlc(df, timeframe)
 
         ok = True
         source = "SAFE_DEMO"
-        msg = msg + " | using safe demo data so dashboard does not blank"
+        msg = f"{msg} | using safe demo data so dashboard does not blank"
 
     df = _normalize_ohlc(df)
+
+    if df.empty:
+        df = synthetic_ohlc(symbol, 1500)
+        if timeframe in ["M2", "M3", "M4", "M10"]:
+            df = resample_ohlc(df, timeframe)
+        df = _normalize_ohlc(df)
+        source = "SAFE_DEMO"
+        msg = f"{msg} | normalized data empty, replaced by safe demo"
 
     st.session_state.last_df = df
     st.session_state.connected = True
     st.session_state.source = source
     st.session_state.last_fetch = time.time()
     st.session_state.timeframe = timeframe
-    st.session_state.symbol = symbol
+    st.session_state.symbol = _clean_symbol(symbol)
 
-    _safe_log(f"Connected {source}: {symbol} {timeframe}")
+    _safe_log(f"Connected {source}: {_clean_symbol(symbol)} {timeframe}")
 
-    return df, ok, source, msg
+    return df, bool(ok), source, msg
 
 
-def maybe_refresh(symbol="XAUUSD", api_key="", refresh_seconds=600, bridge_url="", bridge_token=""):
+def maybe_refresh(
+    symbol="XAUUSD",
+    api_key="",
+    refresh_seconds=600,
+    bridge_url="",
+    bridge_token="",
+):
     if not st.session_state.get("connected"):
         return st.session_state.get("last_df")
 
     last = st.session_state.get("last_fetch", 0)
 
-    if time.time() - last >= refresh_seconds:
+    try:
+        should_refresh = time.time() - float(last) >= float(refresh_seconds)
+    except Exception:
+        should_refresh = True
+
+    if should_refresh:
         source = st.session_state.get("source", "")
 
         if source == "MT5":
@@ -418,15 +481,18 @@ def mt5_account_info():
         info = mt5.account_info()
         positions = mt5.positions_get()
 
-        d = info._asdict() if info else {}
+        account = info._asdict() if info else {}
 
         pos = []
         for p in positions or []:
-            pos.append(p._asdict())
+            try:
+                pos.append(p._asdict())
+            except Exception:
+                pass
 
-        d["positions"] = pos
+        account["positions"] = pos
 
-        return d, True, "Account read ok"
+        return account, True, "Account read ok"
 
     except Exception as e:
         return {}, False, str(e)
@@ -440,19 +506,32 @@ def doo_bridge_account_info(bridge_url="", bridge_token=""):
             return {}, False, "Missing Doo Bridge URL"
 
         headers = {}
+
         if bridge_token:
             headers["Authorization"] = f"Bearer {bridge_token}"
 
-        r = requests.get(bridge_url, params={"account": "1"}, headers=headers, timeout=20)
-        data = r.json()
+        r = requests.get(
+            bridge_url,
+            params={"account": "1"},
+            headers=headers,
+            timeout=25,
+        )
+
+        try:
+            data = r.json()
+        except Exception:
+            return {}, False, f"Doo Bridge invalid response: HTTP {r.status_code}"
 
         if not data.get("ok", False):
-            return {}, False, str(data.get("message", data))[:220]
+            return {}, False, str(data.get("message", data))[:250]
 
         account = data.get("account", {})
         positions = data.get("positions", [])
 
-        account["positions"] = positions
+        if not isinstance(account, dict):
+            account = {}
+
+        account["positions"] = positions if isinstance(positions, list) else []
 
         return account, True, "Doo Bridge account read ok"
 
@@ -460,9 +539,26 @@ def doo_bridge_account_info(bridge_url="", bridge_token=""):
         return {}, False, f"Doo Bridge account error: {e}"
 
 
-def connect_history_60d(mode="fallback", symbol="XAUUSD", api_key="", timeframe="M1", bridge_url="", bridge_token=""):
+def connect_history_60d(
+    mode="fallback",
+    symbol="XAUUSD",
+    api_key="",
+    timeframe="M1",
+    bridge_url="",
+    bridge_token="",
+):
     tf = str(timeframe or "M1").upper()
-    bars = 80000 if tf == "M2" else 120000 if tf == "M1" else 30000
+
+    if tf == "M1":
+        bars = 120000
+    elif tf in ["M2", "M3", "M4"]:
+        bars = 80000
+    elif tf in ["M5", "M10", "M15"]:
+        bars = 30000
+    elif tf in ["M30", "H1"]:
+        bars = 10000
+    else:
+        bars = 5000
 
     return manual_connect(
         mode=mode,
@@ -477,7 +573,10 @@ def connect_history_60d(mode="fallback", symbol="XAUUSD", api_key="", timeframe=
 
 def get_mt5_account_snapshot(bridge_url="", bridge_token=""):
     if bridge_url:
-        info, ok, msg = doo_bridge_account_info(bridge_url=bridge_url, bridge_token=bridge_token)
+        info, ok, msg = doo_bridge_account_info(
+            bridge_url=bridge_url,
+            bridge_token=bridge_token,
+        )
     else:
         info, ok, msg = mt5_account_info()
 

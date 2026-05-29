@@ -4,7 +4,11 @@ import pandas as pd
 from core.database import append_csv, read_csv
 
 
-def _safe_read_csv(name):
+# ============================================================
+# SAFE HELPERS
+# ============================================================
+
+def _safe_read_csv(name: str) -> pd.DataFrame:
     try:
         df = read_csv(name)
         if df is None:
@@ -15,7 +19,7 @@ def _safe_read_csv(name):
         return pd.DataFrame()
 
 
-def _safe_append_csv(name, row):
+def _safe_append_csv(name: str, row: dict) -> bool:
     try:
         append_csv(name, row)
         return True
@@ -24,7 +28,7 @@ def _safe_append_csv(name, row):
         return False
 
 
-def _safe_float(value, default=0.0):
+def _safe_float(value, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
             return default
@@ -33,13 +37,40 @@ def _safe_float(value, default=0.0):
         return default
 
 
-def _risk_color_status(risk_pct, margin_level):
+def _safe_div(numerator, denominator, default: float = 0.0) -> float:
+    try:
+        numerator = float(numerator)
+        denominator = float(denominator)
+        if denominator == 0:
+            return default
+        return numerator / denominator
+    except Exception:
+        return default
+
+
+def _now() -> str:
+    return pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _risk_color_status(risk_pct: float, margin_level: float) -> str:
+    risk_pct = _safe_float(risk_pct)
+    margin_level = _safe_float(margin_level)
+
     if risk_pct <= 1 and margin_level >= 300:
         return "🟢 Safe"
     if risk_pct <= 2 and margin_level >= 150:
         return "🟡 Medium"
     return "🔴 High Risk"
 
+
+def _account_snapshot() -> dict:
+    info = st.session_state.get("account_snapshot", {})
+    return info if isinstance(info, dict) else {}
+
+
+# ============================================================
+# MAIN TAB
+# ============================================================
 
 def show():
     st.markdown("# 🛡️ Risk Tab — Original + Doo Prime Account Inner Tabs")
@@ -51,9 +82,9 @@ def show():
         "Advanced Risk Check",
     ])
 
-    # =========================
-    # TAB 1 — ORIGINAL RISK
-    # =========================
+    # ========================================================
+    # TAB 1 — ORIGINAL RISK CALCULATOR
+    # ========================================================
     with t1:
         st.subheader("Original Risk Calculator")
 
@@ -63,7 +94,7 @@ def show():
             balance = st.number_input(
                 "Balance",
                 min_value=0.0,
-                value=1000.0,
+                value=float(st.session_state.get("risk_balance", 1000.0)),
                 step=50.0,
                 key="risk_balance",
             )
@@ -72,7 +103,7 @@ def show():
                 "Risk %",
                 min_value=0.1,
                 max_value=10.0,
-                value=1.0,
+                value=float(st.session_state.get("risk_percent", 1.0)),
                 step=0.1,
                 key="risk_percent",
             )
@@ -81,7 +112,7 @@ def show():
             sl = st.number_input(
                 "Stop loss pips",
                 min_value=0.0,
-                value=50.0,
+                value=float(st.session_state.get("risk_sl_pips", 50.0)),
                 step=1.0,
                 key="risk_sl_pips",
             )
@@ -89,13 +120,13 @@ def show():
             pip_value = st.number_input(
                 "Pip value per 1 lot",
                 min_value=0.0,
-                value=10.0,
+                value=float(st.session_state.get("risk_pip_value", 10.0)),
                 step=0.1,
                 key="risk_pip_value",
             )
 
         dollar_risk = balance * risk / 100
-        lot = dollar_risk / (sl * pip_value) if sl > 0 and pip_value > 0 else 0
+        lot = _safe_div(dollar_risk, sl * pip_value, 0.0)
 
         c = st.columns(4)
         c[0].metric("Suggested Lot", round(lot, 3))
@@ -112,7 +143,7 @@ def show():
 
         if st.button("💾 Save Risk Plan", key="save_risk_plan", use_container_width=True):
             row = {
-                "time": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "time": _now(),
                 "balance": balance,
                 "risk_pct": risk,
                 "sl_pips": sl,
@@ -125,64 +156,70 @@ def show():
             if _safe_append_csv("risk_plans", row):
                 st.success("Saved risk plan")
 
-    # =========================
-    # TAB 2 — DOO PRIME RISK
-    # =========================
+    # ========================================================
+    # TAB 2 — DOO PRIME ACCOUNT RISK
+    # ========================================================
     with t2:
         st.subheader("Doo Prime Account Risk")
 
-        info = st.session_state.get("account_snapshot", {})
+        info = _account_snapshot()
 
-        if not isinstance(info, dict) or not info:
+        if not info:
             st.info("Read Doo Prime account inside Home first.")
         else:
             bal = _safe_float(info.get("balance", 0))
             eq = _safe_float(info.get("equity", 0))
-            free = _safe_float(
-                info.get("margin_free", info.get("free_margin", 0))
-            )
-            ml = _safe_float(
-                info.get("margin_level", info.get("margin_level_percent", 0))
-            )
+            free = _safe_float(info.get("margin_free", info.get("free_margin", 0)))
+            ml = _safe_float(info.get("margin_level", info.get("margin_level_percent", 0)))
             margin = _safe_float(info.get("margin", 0))
             profit = _safe_float(info.get("profit", 0))
+
+            free_margin_ratio = _safe_div(free, eq, 0.0) * 100
+            equity_gap = eq - bal
 
             c = st.columns(4)
             c[0].metric("Balance", round(bal, 2))
             c[1].metric("Equity", round(eq, 2))
             c[2].metric("Free Margin", round(free, 2))
-            c[3].metric("Margin %", round(ml, 2))
+            c[3].metric("Margin Level %", round(ml, 2))
 
             c2 = st.columns(4)
             c2[0].metric("Used Margin", round(margin, 2))
             c2[1].metric("Floating P/L", round(profit, 2))
-            c2[2].metric("Equity - Balance", round(eq - bal, 2))
-            c2[3].metric("Free Margin Ratio", round((free / eq * 100), 2) if eq > 0 else 0)
+            c2[2].metric("Equity - Balance", round(equity_gap, 2))
+            c2[3].metric("Free Margin Ratio", round(free_margin_ratio, 2))
 
-            loss_room = max(0, eq - free * 0.1)
-            danger_buffer = max(0, free - eq * 0.1)
-            account_status = _risk_color_status(st.session_state.get("risk_percent", 1.0), ml)
+            danger_equity_floor = eq * 0.10
+            loss_room = max(0, eq - danger_equity_floor)
+            danger_buffer = max(0, free - danger_equity_floor)
+
+            current_risk = st.session_state.get("risk_percent", 1.0)
+            account_status = _risk_color_status(current_risk, ml)
 
             st.metric("Estimated Loss Room Before Danger", round(loss_room, 2))
             st.metric("Danger Buffer", round(danger_buffer, 2))
             st.markdown(f"### Account Status: {account_status}")
 
-            if ml and ml < 100:
+            if ml > 0 and ml < 100:
                 st.error("Margin level is dangerous. Avoid new trades.")
-            elif ml and ml < 150:
+            elif ml > 0 and ml < 150:
                 st.warning("Margin level is weak. Reduce exposure.")
             elif ml >= 300:
                 st.success("Margin level looks healthy.")
+            elif ml == 0:
+                st.info("Margin level is 0 or unavailable.")
 
             if st.button("💾 Save Doo Prime Risk Snapshot", key="save_doo_risk", use_container_width=True):
                 row = {
-                    "time": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "time": _now(),
                     "balance": bal,
                     "equity": eq,
                     "free_margin": free,
                     "margin_level": ml,
                     "used_margin": margin,
                     "floating_profit": profit,
+                    "equity_gap": equity_gap,
+                    "free_margin_ratio": free_margin_ratio,
                     "loss_room": loss_room,
                     "danger_buffer": danger_buffer,
                     "status": account_status,
@@ -191,16 +228,21 @@ def show():
                 if _safe_append_csv("risk_snapshots", row):
                     st.success("Doo Prime risk snapshot saved")
 
-    # =========================
+    # ========================================================
     # TAB 3 — RISK HISTORY
-    # =========================
+    # ========================================================
     with t3:
         st.subheader("Risk History")
 
         risk_df = _safe_read_csv("risk_plans")
         snap_df = _safe_read_csv("risk_snapshots")
+        adv_df = _safe_read_csv("advanced_risk_checks")
 
-        h1, h2 = st.tabs(["Risk Plans", "Doo Prime Snapshots"])
+        h1, h2, h3 = st.tabs([
+            "Risk Plans",
+            "Doo Prime Snapshots",
+            "Advanced Checks",
+        ])
 
         with h1:
             if risk_df.empty:
@@ -214,9 +256,15 @@ def show():
             else:
                 st.dataframe(snap_df.tail(300), use_container_width=True)
 
-    # =========================
+        with h3:
+            if adv_df.empty:
+                st.info("No saved advanced risk checks yet.")
+            else:
+                st.dataframe(adv_df.tail(300), use_container_width=True)
+
+    # ========================================================
     # TAB 4 — ADVANCED RISK CHECK
-    # =========================
+    # ========================================================
     with t4:
         st.subheader("Advanced Risk Check")
 
@@ -258,11 +306,14 @@ def show():
         daily_loss_amount = balance2 * max_daily_loss / 100
         one_trade_loss = balance2 * risk_per_trade / 100
 
+        max_slots = int(max_daily_loss // risk_per_trade) if risk_per_trade > 0 else 0
+        remaining_slots = max(0, max_slots - open_trades)
+
         c = st.columns(4)
         c[0].metric("One Trade Risk $", round(one_trade_loss, 2))
         c[1].metric("Total Open Risk %", round(total_open_risk, 2))
         c[2].metric("Max Daily Loss $", round(daily_loss_amount, 2))
-        c[3].metric("Remaining Trade Slots", max(0, int(max_daily_loss // risk_per_trade) - open_trades))
+        c[3].metric("Remaining Trade Slots", remaining_slots)
 
         if total_open_risk >= max_daily_loss:
             st.error("Open risk is already at or above your daily loss limit. Do not add new trades.")
@@ -273,7 +324,7 @@ def show():
 
         if st.button("💾 Save Advanced Risk Check", key="save_advanced_risk", use_container_width=True):
             row = {
-                "time": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "time": _now(),
                 "balance": balance2,
                 "open_trades": open_trades,
                 "risk_per_trade": risk_per_trade,
@@ -281,6 +332,7 @@ def show():
                 "total_open_risk": total_open_risk,
                 "daily_loss_amount": daily_loss_amount,
                 "one_trade_loss": one_trade_loss,
+                "remaining_slots": remaining_slots,
             }
 
             if _safe_append_csv("advanced_risk_checks", row):

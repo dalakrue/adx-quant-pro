@@ -27,6 +27,9 @@ except Exception:
 
 
 def _clean_ohlc(df):
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
     df = df.copy()
 
     for c in ["open", "high", "low", "close"]:
@@ -36,6 +39,11 @@ def _clean_ohlc(df):
 
     if "time" in df.columns:
         df["time"] = pd.to_datetime(df["time"], errors="coerce")
+
+    if "volume" not in df.columns:
+        df["volume"] = 0
+
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
 
     df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna(subset=["open", "high", "low", "close"])
@@ -110,14 +118,17 @@ def add_indicators(df):
     df["pressure"] = df["plus_di"] - df["minus_di"]
     df["adx_slope"] = df["adx"].diff().fillna(0)
 
+    df["range"] = (df["high"] - df["low"]).replace(0, np.nan)
+    df["body"] = (df["close"] - df["open"]).abs()
+    df["wick_ratio"] = ((df["range"] - df["body"]) / df["range"]).fillna(0)
+
     df["volatility"] = df["ret"].rolling(30, min_periods=1).std().fillna(0)
-    df["mean_dist"] = (df["close"] - df["close"].rolling(50, min_periods=1).mean()).fillna(0)
     df["vol_decay"] = df["volatility"].diff().fillna(0)
     df["fat_tail"] = df["ret"].rolling(60, min_periods=5).kurt().fillna(0)
 
-    df["body"] = (df["close"] - df["open"]).abs()
-    df["range"] = (df["high"] - df["low"]).replace(0, np.nan)
-    df["wick_ratio"] = ((df["range"] - df["body"]) / df["range"]).fillna(0)
+    df["ma20"] = df["close"].rolling(20, min_periods=1).mean()
+    df["ma50"] = df["close"].rolling(50, min_periods=1).mean()
+    df["mean_dist"] = (df["close"] - df["ma50"]).fillna(0)
 
     df["trend_power"] = df["adx"] * df["pressure"].abs()
     df["momentum_velocity"] = df["momentum"].rolling(5, min_periods=1).mean()
@@ -125,9 +136,78 @@ def add_indicators(df):
         df["range"] / df["range"].rolling(20, min_periods=1).mean().replace(0, np.nan)
     ).fillna(0)
 
-    df = df.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
+    df["directional_efficiency"] = (
+        (df["close"] - df["close"].shift(30)).abs()
+        / df["close"].diff().abs().rolling(30, min_periods=1).sum().replace(0, np.nan)
+    ).fillna(0)
 
+    df["trend_age"] = (
+        (np.sign(df["pressure"]) == np.sign(df["pressure"].shift(1)))
+        .astype(int)
+        .rolling(30, min_periods=1)
+        .sum()
+    )
+
+    df["exhaustion_risk"] = np.clip(
+        (df["wick_ratio"] * 35)
+        + (df["fat_tail"].clip(lower=0) * 5)
+        + (df["trend_age"] / 30 * 25)
+        - (df["directional_efficiency"] * 20),
+        0,
+        100,
+    )
+
+    df["start_impulse_score"] = np.clip(
+        (df["adx_slope"].clip(lower=0) * 8)
+        + (df["range_expansion"] * 20)
+        + (df["directional_efficiency"] * 35)
+        + (df["pressure"].abs() / 2),
+        0,
+        100,
+    )
+
+    df = df.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
     return df.reset_index(drop=True)
+
+
+def regime_label(df):
+    df = add_indicators(df)
+
+    if df.empty:
+        return "UNKNOWN", {}
+
+    last = df.iloc[-1]
+
+    adx = float(last.get("adx", 0))
+    slope = float(last.get("adx_slope", 0))
+    eff = float(last.get("directional_efficiency", 0))
+    expansion = float(last.get("range_expansion", 0))
+    exhaustion = float(last.get("exhaustion_risk", 0))
+    start_score = float(last.get("start_impulse_score", 0))
+    pressure = float(last.get("pressure", 0))
+
+    if start_score >= 65 and slope > 0 and eff >= 0.35:
+        regime = "IMPULSE_START"
+    elif adx >= 25 and eff >= 0.25 and exhaustion < 60:
+        regime = "TREND_CONTINUATION"
+    elif exhaustion >= 70:
+        regime = "EXHAUSTION_OR_REVERSAL_RISK"
+    elif expansion < 0.85 and adx < 20:
+        regime = "ACCUMULATION_OR_RANGE"
+    elif adx < 18 and abs(pressure) < 8:
+        regime = "DISTRIBUTION_OR_CHOP"
+    else:
+        regime = "WAIT_CONFIRMATION"
+
+    return regime, {
+        "adx": round(adx, 2),
+        "adx_slope": round(slope, 4),
+        "directional_efficiency": round(eff, 3),
+        "range_expansion": round(expansion, 3),
+        "exhaustion_risk": round(exhaustion, 1),
+        "start_impulse_score": round(start_score, 1),
+        "pressure": round(pressure, 2),
+    }
 
 
 def ml_bias(df):
@@ -140,7 +220,8 @@ def ml_bias(df):
         "adx", "plus_di", "minus_di", "atr", "pressure",
         "adx_slope", "momentum", "volatility", "mean_dist",
         "vol_decay", "fat_tail", "wick_ratio", "trend_power",
-        "momentum_velocity", "range_expansion"
+        "momentum_velocity", "range_expansion",
+        "directional_efficiency", "exhaustion_risk", "start_impulse_score",
     ]
 
     if len(df) < 100 or RandomForestClassifier is None or GradientBoostingClassifier is None:
@@ -168,8 +249,8 @@ def ml_bias(df):
         y_train = y.iloc[:split]
 
         rf = RandomForestClassifier(
-            n_estimators=160,
-            max_depth=7,
+            n_estimators=180,
+            max_depth=8,
             min_samples_leaf=3,
             random_state=7,
             n_jobs=-1,
@@ -177,7 +258,7 @@ def ml_bias(df):
 
         gb = GradientBoostingClassifier(
             random_state=11,
-            n_estimators=90,
+            n_estimators=100,
             max_depth=3,
         )
 
@@ -188,7 +269,6 @@ def ml_bias(df):
 
         rf_buy = float(rf.predict_proba(x)[0][1])
         gb_buy = float(gb.predict_proba(x)[0][1])
-
         pr = (rf_buy * 0.55) + (gb_buy * 0.45)
 
         bias = "BUY" if pr >= 0.5 else "SELL"
@@ -231,7 +311,9 @@ def history_match(df, trade_history=None):
             m = hist.sort_values("dist").head(30)
             sample = len(m)
 
-            wins = m["result"].astype(str).str.upper().isin(["WIN", "PROFIT", "TP", "TAKE_PROFIT"]).mean()
+            wins = m["result"].astype(str).str.upper().isin(
+                ["WIN", "PROFIT", "TP", "TAKE_PROFIT"]
+            ).mean()
 
             if not np.isnan(wins):
                 return float(np.clip(wins, 0.25, 0.85)), sample
@@ -240,7 +322,9 @@ def history_match(df, trade_history=None):
 
     score = float(
         np.clip(
-            0.50 + np.tanh(abs(float(latest["pressure"])) / 30 + float(latest["adx"]) / 100) / 4,
+            0.50 + np.tanh(
+                abs(float(latest["pressure"])) / 30 + float(latest["adx"]) / 100
+            ) / 4,
             0.35,
             0.75,
         )
@@ -265,6 +349,7 @@ def quant_stack(df, trade_history=None, account=None):
 
     bias, conf, meta = ml_bias(df)
     hm, hm_n = history_match(df, trade_history)
+    regime, regime_meta = regime_label(df)
 
     vol = float(last.get("volatility", 0))
     mean_dist = float(last.get("mean_dist", 0))
@@ -273,12 +358,16 @@ def quant_stack(df, trade_history=None, account=None):
     mean_revert_risk = min(1, abs(mean_dist) / (atr * 3 + 1e-9))
     decay = max(0, -float(last.get("vol_decay", 0)) * 10000)
     fat_tail = min(1, max(0, float(last.get("fat_tail", 0)) / 10))
+    exhaustion = min(1, float(last.get("exhaustion_risk", 0)) / 100)
+    impulse = min(1, float(last.get("start_impulse_score", 0)) / 100)
 
     bayes = (
-        conf * 0.45
-        + hm * 0.30
-        + (1 - mean_revert_risk) * 0.15
+        conf * 0.38
+        + hm * 0.25
+        + (1 - mean_revert_risk) * 0.12
         + (1 - fat_tail) * 0.10
+        + impulse * 0.10
+        + (1 - exhaustion) * 0.05
     )
 
     safe_pct = float(np.clip(bayes * 100, 1, 99))
@@ -286,7 +375,6 @@ def quant_stack(df, trade_history=None, account=None):
     try:
         ret_mean = float(df["ret"].tail(200).mean())
         ret_std = float(df["ret"].tail(200).std() + 1e-8)
-
         mc = np.random.default_rng(42).normal(ret_mean, ret_std, (300, 720)).sum(axis=1)
         mc_positive = float((mc > 0).mean()) if bias == "BUY" else float((mc < 0).mean())
     except Exception:
@@ -296,16 +384,19 @@ def quant_stack(df, trade_history=None, account=None):
         np.clip(abs(float(last["pressure"])) / (float(last["adx"]) + 1) / 3, 0, 1)
     )
 
-    ergodicity = float(np.clip(1 - fat_tail * 0.55 - mean_revert_risk * 0.25, 0, 1))
+    ergodicity = float(np.clip(1 - fat_tail * 0.55 - mean_revert_risk * 0.25 - exhaustion * 0.20, 0, 1))
 
     final_pct = float(
         np.clip(
-            (safe_pct * 0.65 + mc_positive * 100 * 0.20 + ergodicity * 100 * 0.15)
+            (safe_pct * 0.60 + mc_positive * 100 * 0.20 + ergodicity * 100 * 0.12 + impulse * 100 * 0.08)
             - spoofing_risk * 8,
             1,
             99,
         )
     )
+
+    if regime in ["EXHAUSTION_OR_REVERSAL_RISK", "DISTRIBUTION_OR_CHOP"]:
+        final_pct *= 0.82
 
     if final_pct < 45:
         final_bias = "WAIT"
@@ -316,22 +407,33 @@ def quant_stack(df, trade_history=None, account=None):
         "bias": final_bias,
         "safe_pct": round(final_pct, 1),
         "scale10": round(final_pct / 10, 1),
+
+        "regime": regime,
+        "regime_meta": regime_meta,
+
         "ml_conf_pct": round(conf * 100, 1),
         "history_match_pct": round(hm * 100, 1),
         "history_samples": hm_n,
+
         "volatility": round(vol, 8),
         "vol_decay": round(decay, 2),
         "mean_revert_risk_pct": round(mean_revert_risk * 100, 1),
         "fat_tail_risk_pct": round(fat_tail * 100, 1),
+        "exhaustion_risk_pct": round(exhaustion * 100, 1),
+        "impulse_start_pct": round(impulse * 100, 1),
+
         "bayes_pct": round(bayes * 100, 1),
         "kelly_fraction": round(max(0, min(0.25, (bayes * 2 - 1) / 2)), 3),
         "monte_carlo_pct": round(mc_positive * 100, 1),
         "ergodicity_pct": round(ergodicity * 100, 1),
         "spoofing_risk_pct": round(spoofing_risk * 100, 1),
+
         "meta": meta,
         "adx": round(float(last["adx"]), 2),
         "pressure": round(float(last["pressure"]), 2),
         "atr": round(float(atr), 4),
+        "directional_efficiency": round(float(last.get("directional_efficiency", 0)), 3),
+        "range_expansion": round(float(last.get("range_expansion", 0)), 3),
     }
 
 
@@ -357,7 +459,6 @@ def pre_manual_decision(plus_now, minus_now, plus_prev, minus_prev, selected_dec
         raw = 100 - abs(raw - 50)
 
     pct = float(np.clip(raw, 0, 100))
-
     bias = "BUY" if pressure > 0 else "SELL" if pressure < 0 else "WAIT"
 
     return {

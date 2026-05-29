@@ -1,17 +1,14 @@
+import time
 import streamlit as st
 import pandas as pd
 import numpy as np
-import time
 
 
-# Reduced sidebar choices: Mix is inside Engine, Risk + Doo Prime are inside Home, Pre is inside Prelive.
 DEFAULT_TABS = [
     "Home",
     "Engine",
-    "Backtest",
+    "Train Data",
     "Pre Original",
-    "Backtest Original",
-    "Prelive",
     "Profile",
 ]
 
@@ -19,23 +16,29 @@ DEFAULT_TABS = [
 def safe_float(v, default=0.0):
     try:
         if v is None:
-            return default
-        if str(v).strip() == "":
-            return default
-        return float(v)
+            return float(default)
+
+        if isinstance(v, str):
+            v = v.strip().replace(",", "")
+            if v == "":
+                return float(default)
+
+        value = float(v)
+
+        if np.isnan(value) or np.isinf(value):
+            return float(default)
+
+        return value
+
     except Exception:
-        return default
+        return float(default)
 
 
 def safe_int(v, default=0):
     try:
-        if v is None:
-            return default
-        if str(v).strip() == "":
-            return default
-        return int(float(v))
+        return int(safe_float(v, default))
     except Exception:
-        return default
+        return int(default)
 
 
 def init_state():
@@ -60,6 +63,10 @@ def init_state():
         "profile_name": "Quant Trader",
 
         "twelve_api_key": "",
+        "connector_mode": "fallback",
+        "connector_bars": 5000,
+        "doo_bridge_url": "",
+        "doo_bridge_token": "",
         "account_snapshot": {},
         "doo_positions": [],
 
@@ -76,10 +83,29 @@ def init_state():
         if k not in st.session_state:
             st.session_state[k] = v
 
+    # Repair corrupted important states
+    if not isinstance(st.session_state.get("activity_log"), list):
+        st.session_state.activity_log = []
+
+    if not isinstance(st.session_state.get("notes"), list):
+        st.session_state.notes = []
+
+    if not isinstance(st.session_state.get("trade_history"), list):
+        st.session_state.trade_history = []
+
+    if not isinstance(st.session_state.get("account_snapshot"), dict):
+        st.session_state.account_snapshot = {}
+
+    if not isinstance(st.session_state.get("doo_positions"), list):
+        st.session_state.doo_positions = []
+
+    if not isinstance(st.session_state.get("training_rows"), list):
+        st.session_state.training_rows = []
+
 
 def log_event(msg):
     try:
-        if "activity_log" not in st.session_state:
+        if "activity_log" not in st.session_state or not isinstance(st.session_state.activity_log, list):
             st.session_state.activity_log = []
 
         st.session_state.activity_log.insert(
@@ -133,11 +159,14 @@ def start_timer(minutes=None):
         minutes = st.session_state.get("timer_minutes", 120)
 
     minutes = safe_float(minutes, 120)
+    minutes = max(1, min(minutes, 1440))
 
     end_time = time.time() + minutes * 60
 
+    st.session_state.timer_minutes = int(minutes)
     st.session_state.timer_end_time = end_time
     st.session_state.trade_end_time = end_time
+    st.session_state.trade_timer_running = True
 
     log_event(f"Timer started: {minutes} minutes")
 
@@ -147,6 +176,7 @@ def start_timer(minutes=None):
 def stop_timer():
     st.session_state.timer_end_time = None
     st.session_state.trade_end_time = None
+    st.session_state.trade_timer_running = False
     log_event("Timer stopped")
 
 
@@ -168,6 +198,12 @@ def synthetic_ohlc(symbol="XAUUSD", bars=1500):
     elif "GBP" in symbol:
         base = 1.27
         scale = 0.00035
+    elif "BTC" in symbol:
+        base = 65000
+        scale = 40
+    elif "ETH" in symbol:
+        base = 3500
+        scale = 5
     else:
         base = 100
         scale = 0.10
@@ -178,7 +214,6 @@ def synthetic_ohlc(symbol="XAUUSD", bars=1500):
 
     high = np.maximum(open_, close) + np.abs(rng.normal(0, scale * 0.5, bars))
     low = np.minimum(open_, close) - np.abs(rng.normal(0, scale * 0.5, bars))
-
     volume = rng.integers(100, 3000, size=bars)
 
     return pd.DataFrame(
@@ -199,7 +234,7 @@ def synthetic_ohlc(symbol="XAUUSD", bars=1500):
 
 def normalize_symbol(symbol="XAUUSD"):
     symbol = str(symbol or "XAUUSD").strip().upper()
-    return symbol.replace(" ", "")
+    return symbol.replace(" ", "").replace("/", "")
 
 
 def is_phone_mode():

@@ -1,22 +1,30 @@
 from pathlib import Path
-import pandas as pd
 import json
 import tempfile
 import shutil
+import pandas as pd
 
 
 DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_name(name):
+    safe_name = str(name or "default").strip()
+    safe_name = safe_name.replace("/", "_").replace("\\", "_")
+    safe_name = safe_name.replace("..", "_").replace(":", "_")
+    safe_name = safe_name.replace("*", "_").replace("?", "_")
+    safe_name = safe_name.replace('"', "_").replace("<", "_")
+    safe_name = safe_name.replace(">", "_").replace("|", "_")
+    return safe_name or "default"
 
 
 def _csv_path(name):
-    safe_name = str(name).replace("/", "_").replace("\\", "_")
-    return DATA_DIR / f"{safe_name}.csv"
+    return DATA_DIR / f"{_safe_name(name)}.csv"
 
 
 def _json_path(name):
-    safe_name = str(name).replace("/", "_").replace("\\", "_")
-    return DATA_DIR / f"{safe_name}.json"
+    return DATA_DIR / f"{_safe_name(name)}.json"
 
 
 def append_csv(name, row):
@@ -103,19 +111,43 @@ def overwrite_csv(name, rows):
     path = _csv_path(name)
 
     try:
+        if rows is None:
+            rows = []
+
         df = pd.DataFrame(rows)
-        df.to_csv(path, index=False, encoding="utf-8-sig")
+
+        with tempfile.NamedTemporaryFile(
+            "w",
+            delete=False,
+            encoding="utf-8-sig",
+            suffix=".csv",
+            dir=str(DATA_DIR),
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+
+        df.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+        shutil.move(str(tmp_path), str(path))
+
         return True
+
     except Exception:
         return False
 
 
 def delete_data_file(name, file_type="csv"):
     try:
-        path = _csv_path(name) if file_type == "csv" else _json_path(name)
+        file_type = str(file_type or "csv").lower().strip()
+
+        if file_type == "json":
+            path = _json_path(name)
+        else:
+            path = _csv_path(name)
+
         if path.exists():
             path.unlink()
+
         return True
+
     except Exception:
         return False
 
@@ -123,12 +155,41 @@ def delete_data_file(name, file_type="csv"):
 def list_data_files():
     try:
         files = []
+
         for p in DATA_DIR.glob("*"):
-            files.append({
-                "name": p.name,
-                "size_bytes": p.stat().st_size,
-                "modified": pd.Timestamp.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-            })
+            if not p.is_file():
+                continue
+
+            stat = p.stat()
+
+            files.append(
+                {
+                    "name": p.name,
+                    "type": p.suffix.replace(".", "").upper(),
+                    "size_bytes": stat.st_size,
+                    "modified": pd.Timestamp.fromtimestamp(stat.st_mtime).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                }
+            )
+
         return pd.DataFrame(files)
+
     except Exception:
         return pd.DataFrame()
+
+
+def file_exists(name, file_type="csv"):
+    file_type = str(file_type or "csv").lower().strip()
+    path = _json_path(name) if file_type == "json" else _csv_path(name)
+    return path.exists()
+
+
+def clear_all_data():
+    try:
+        for p in DATA_DIR.glob("*"):
+            if p.is_file() and p.suffix.lower() in [".csv", ".json"]:
+                p.unlink()
+        return True
+    except Exception:
+        return False
